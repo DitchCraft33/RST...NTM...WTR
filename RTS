@@ -1,0 +1,167 @@
+import requests
+import re
+import time
+import os
+import sys
+import select
+from datetime import datetime, timedelta
+
+def degrees_to_mils(degrees):
+    return round((int(degrees) * 6400) / 360)
+
+def degrees_to_cardinal(d):
+    dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+    ix = int((int(d) + 11.25) / 22.5)
+    return dirs[ix % 16]
+
+def knots_to_mph(kt):
+    return round(int(kt) * 1.15078, 1)
+
+def feet_to_meters(ft):
+    return round(ft * 0.3048)
+
+def fetch_weather(location_id, mode):
+    station = "EGNV" if location_id == "" else location_id.upper()
+    endpoint = "taf" if mode == "T" else "metar"
+    url = f"https://aviationweather.gov/api/data/{endpoint}?ids={station}"
+    try:
+        response = requests.get(url, timeout=10)
+        return response.text.strip(), station
+    except:
+        return None, station
+
+def translate_weather(raw, mode):
+    if not raw: return []
+    translation = []
+    
+    wx_map = {
+        "DZ": "Drizzle", "RA": "Rain", "SN": "Snow", "SG": "Snow Grains",
+        "IC": "Ice Crystals", "PL": "Ice Pellets", "GR": "Hail", "GS": "Small Hail",
+        "BR": "Mist", "FG": "Fog", "FU": "Smoke", "VA": "Volcanic Ash",
+        "DU": "Dust", "SA": "Sand", "HZ": "Haze", "SQ": "Squall", "TS": "Thunderstorm"
+    }
+
+    chunks = re.split(r'\s(?=TEMPO|BECMG|PROB|FM)', raw) if mode == "T" else [raw]
+
+    for i, block in enumerate(chunks):
+        if i > 0: translation.append("") 
+
+        header_match = re.search(r"(TEMPO|BECMG|PROB\d{2}|FM)", block)
+        if header_match:
+            h = header_match.group(1)
+            lbl = "Temporary" if "TEMPO" in h else "Becoming" if "BECMG" in h else "Risk" if "PROB" in h else "From"
+            translation.append(f"{h} ({lbl}):")
+
+        if i == 0:
+            t_match = re.search(r"(\d{2})(\d{2})(\d{2})Z", block)
+            if t_match:
+                translation.append(f"{t_match.group(0)}: Day {t_match.group(1)}, time {t_match.group(2)}:{t_match.group(3)} Zulu.")
+
+        win_match = re.search(r"(\d{2})(\d{2})/(\d{2})(\d{2})", block)
+        if win_match:
+            d1, h1, d2, h2 = win_match.groups()
+            translation.append(f"WINDOW: {d1} {h1}00 // {d2} {h2}00.")
+
+        w_match = re.search(r"(\d{3})(\d{2,3})(?:G(\d{2,3}))?KT", block)
+        if w_match:
+            deg, speed_kt, gust_kt = w_match.groups()
+            wind_str = f"{w_match.group(0)}: Wind {degrees_to_mils(deg)} mils ({degrees_to_cardinal(deg)}) at {speed_kt} KT ({knots_to_mph(speed_kt)} mph)"
+            if gust_kt: wind_str += f" GUSTING {gust_kt} KT ({knots_to_mph(gust_kt)} mph)"
+            translation.append(wind_str + ".")
+
+        if "CAVOK" in block:
+            translation.append("CAVOK: Ceiling and VIS OK (Vis 10km+, No clouds <5000ft / 1524m).")
+        else:
+            v_match = re.search(r"\s(\d{4})\s", block)
+            if v_match: translation.append(f"{v_match.group(1)}: VIS is {'10km+' if v_match.group(1) == '9999' else v_match.group(1)+'m'}.")
+
+        found_wx = []
+        for code, name in wx_map.items():
+            if re.search(fr"\b(-|\+)?({code})+\b", block):
+                found_wx.append(name)
+        if found_wx:
+            translation.append(f"WEATHER: {', '.join(found_wx)}.")
+
+        for code, height_code in re.findall(r"(FEW|SCT|BKN|OVC|NSC|NCD|CLR)(\d{3})[/\w]*", block):
+            h_feet = int(height_code) * 100
+            translation.append(f"{code}{height_code}: '{code}' clouds at {h_feet:,} ft ({feet_to_meters(h_feet):,} m).")
+
+        if mode != "T":
+            icao_match = re.search(r"\b([A-Z]{4})\b", block)
+            if icao_match:
+                icao = icao_match.group(1)
+                bases = {"EGNV": "Teesside Intl", "EGXE": "Leeming RAF", "EGXW": "Waddington RAF", "EGXC": "Coningsby RAF", "EGXP": "Scampton RAF", "EGXZ": "RAF Topcliffe", "EGNT": "Newcastle International", "EGNM": "Leeds Bradford", "EGNJ": "Humberside Airport"}
+                translation.append(f"{icao}: {bases.get(icao, 'Field Station')}.")
+            tmp_match = re.search(r"([-?M\d]{2})/([-?M\d]{2})", block)
+            if tmp_match:
+                t, d = int(tmp_match.group(1).replace('M', '-')), int(tmp_match.group(2).replace('M', '-'))
+                translation.append(f"{tmp_match.group(1)}/{tmp_match.group(2)}: Temp {t}°C / Dew {d}°C (Delta-T: {t-d}°C){' [!! FOG RISK HIGH !!]' if (t-d) <= 2 else ''}")
+            q_match = re.search(r"Q(\d{4})", block)
+            if q_match: translation.append(f"Q{q_match.group(1)}: Altimeter (QNH) is {q_match.group(1)} hPa.")
+
+        colors = re.findall(r"\b(BLU|WHT|GRN|YLO|AMB|RED|BLACK)\b", block)
+        if colors:
+            c_map = {"BLU": "BLUE (Excellent)", "WHT": "WHITE (Good)", "GRN": "GREEN (Fair)", "YLO": "YELLOW (Caution)", "AMB": "AMBER (Critical)", "RED": "RED (Danger)", "BLACK": "BLACK (Field Closed)"}
+            translation.append(f"COLOUR C: {c_map.get(colors[0], colors[0])}")
+            if len(colors) >= 2: translation.append(f"COLOUR T: {c_map.get(colors[1], colors[1])}")
+    
+    return translation
+
+os.system('clear')
+print("")
+mode_input = input("  > (R)ECCI, (S)PECI or (T)AF: ").upper() 
+print("")
+loc = input("  > ID (DEFAULTS EGNV): ").strip() 
+last_data = None
+
+while True:
+    raw_data, station_id = fetch_weather(loc, mode_input)
+    now = datetime.now()
+    if raw_data:
+        os.system('clear')
+        if last_data and raw_data != last_data: print("\a")
+        print(f"\n  {raw_data}\n")
+        for line in translate_weather(raw_data, mode_input):
+            if line == "": print("")
+            else: print(f"  > {line}")
+        last_data = raw_data
+        
+        if mode_input == 'S':
+            next_min = (now.minute // 10 + 1) * 10
+            next_time = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)) if next_min == 60 else now.replace(minute=next_min, second=0, microsecond=0)
+            print(f"\n  > NEXT REP : {next_time.strftime('%H:%M')}")
+        
+        sys.stdout.write("\n  > (A)LT, (M)ODE or (E)XIT: ")
+        sys.stdout.flush()
+
+        cmd = ""
+        if mode_input == 'S':
+            while datetime.now() < next_time:
+                if select.select([sys.stdin], [], [], 1)[0]:
+                    cmd = sys.stdin.readline().strip().upper()
+                    break 
+            if cmd == "": continue 
+        else:
+            cmd = sys.stdin.readline().strip().upper()
+
+        if cmd == 'A':
+            loc = input("\n  > ENTER NEW LOCATION ID: ").strip()
+            last_data = None
+            continue
+        elif cmd == 'M':
+            print("")
+            mode_input = input("  > (R)ECCI, (S)PECI or (T)AF: ").upper()
+            last_data = None
+            continue
+        elif cmd == 'E':
+            break
+        elif mode_input != 'S':
+            break
+    else:
+        print("\n  !! DATA UNAVAILABLE !!")
+        cmd = input("\n  > (A)LT or (E)XIT : ").upper()
+        if cmd == 'A':
+            loc = input("\n  > ENTER NEW LOCATION ID: ").strip()
+            continue
+        else: break
