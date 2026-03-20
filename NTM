@@ -1,0 +1,191 @@
+import requests, re, os, textwrap
+import xml.etree.ElementTree as ET
+from math import radians, cos, sin, asin, sqrt, tan, floor
+from datetime import datetime
+
+Q_SUBJ = {'RD': 'RESTRICTED DANGER', 'WP': 'UAS / DRONE', 'RP': 'RESTRICTED AREA', 'WJ': 'MODEL FLYING', 'OB': 'OBSTACLE'}
+Q_COND = {'CS': 'EQUIPMENT INSTALLED', 'LW': 'WILL TAKE PLACE', 'AC': 'ACTIVE', 'RT': 'RESTRICTED'}
+TRAFFIC_MAP = {'I': 'IFR', 'V': 'VFR', 'IV': 'IFR , VFR'}
+PURPOSE_MAP = {'BO': 'PRE FLIGHT BULLETINS // SIGNIFICANT IFR', 'NBO': 'IMMEDIATE / PRE-FLIGHT', 'M': 'MISC'}
+SCOPE_MAP = {'AW': 'AERODROME , NAV WARNING', 'W': 'NAV WARNING', 'A': 'AERODROME'}
+
+def decimal_to_grid(lat, lon):
+    try:
+        a, b, e0, n0 = 6377563.396, 6356256.909, 400000, -100000
+        phi, lam = radians(lat), radians(lon)
+        phi0, lam0 = radians(49), radians(-2)
+        af0, bf0 = a * 0.9996012717, b * 0.9996012717
+        n = (af0 - bf0) / (af0 + bf0)
+        v = af0 * (1 - ((af0**2 - bf0**2) / af0**2) * sin(phi)**2)**-0.5
+        rho = af0 * (1 - ((af0**2 - bf0**2) / af0**2)) * (1 - ((af0**2 - bf0**2) / af0**2) * sin(phi)**2)**-1.5
+        eta2 = v / rho - 1
+        M = bf0 * (((1 + n + 5/4*n**2 + 5/4*n**3) * (phi-phi0)) - ((3*n + 3*n**2 + 21/8*n**3) * sin(phi-phi0) * cos(phi+phi0)) + ((15/8*n**2 + 15/8*n**3) * sin(2*(phi-phi0)) * cos(2*(phi+phi0))) - (35/24*n**3 * sin(3*(phi-phi0)) * cos(3*(phi+phi0))))
+        I, II, III = M + n0, (v/2) * sin(phi) * cos(phi), (v/24) * sin(phi) * cos(phi)**3 * (5 - tan(phi)**2 + 9 * eta2)
+        IV, V = v * cos(phi), (v/6) * cos(phi)**3 * (v/rho - tan(phi)**2)
+        E, N = e0 + IV*(lam-lam0) + V*(lam-lam0)**3, I + II*(lam-lam0)**2 + III*(lam-lam0)**4
+        e100, n100 = floor(E/100000), floor(N/100000)
+        l1, l2 = (19-n100)-(19-n100)%5 + floor((e100+10)/5), (19-n100)%5*5 + e100%5
+        def let(x): return chr(ord('A') + (x if x < 8 else x+1))
+        return f"{let(l1)}{let(l2)} {str(floor((E%100000)/100)).zfill(3)} {str(floor((N%100000)/100)).zfill(3)}"
+    except: return "NZ 000 000"
+
+def dms_to_dec(s):
+    try:
+        if s[-1] in ['N', 'S']:
+            d, m, sec = int(s[:2]), int(s[2:4]), int(s[4:6]) if len(s) > 5 else 0
+        else:
+            d, m, sec = int(s[:3]), int(s[3:5]), int(s[5:7]) if len(s) > 6 else 0
+        dec = d + (m/60.0) + (sec/3600.0)
+        return -dec if s[-1] in ['S', 'W'] else dec
+    except: return 0.0
+
+def show_summary_view(item, nid):
+    while True:
+        os.system('clear')
+        body = item['body']
+        q_match = re.search(r"Q\)\s*([A-Z]{4})/Q([A-Z]{2})([A-Z]{2})/([A-Z/]+)/([A-Z/]+)/([A-Z/]+)/(\d{3})/(\d{3})", body)
+        if q_match:
+            fir, qs, qc, traf, purp, scop, low, upp = q_match.groups()
+            q_code = f"{qs}{qc}"; q_desc = f"{Q_SUBJ.get(qs, qs)} , {Q_COND.get(qc, qc)}"
+            affects = TRAFFIC_MAP.get(traf, traf); purpose = PURPOSE_MAP.get(purp, purp); scope_str = SCOPE_MAP.get(scop, scop)
+            h_bot = f"{int(low)*100}ft AMSL" if low != '000' else "SURFACE"
+            h_top = f"{int(upp)*100}ft ({round(int(upp)*30.48)}m AGL)" if upp != '999' else "UNLIMITED"
+        else:
+            fir, q_code, q_desc, affects, purpose, scope_str, h_bot, h_top = "EGTT", "RDCS", "RESTRICTED DANGER , EQUIPMENT INSTALLED", "IFR , VFR", "PRE FLIGHT BULLETINS // SIGNIFICANT IFR", "AERODROME , NAV WARNING", "SURFACE", "400ft (122m AGL)"
+
+        c = re.search(r"(\d{6}[NS])\s*(\d{7}[EW])", body)
+        lat_dec, lon_dec, grid, c_disp = 0.0, 0.0, "NZ 000 000", "UNK"
+        if c:
+            lat_dec, lon_dec = dms_to_dec(c.group(1)), dms_to_dec(c.group(2))
+            grid, c_disp = decimal_to_grid(lat_dec, lon_dec), f"{c.group(1)} {c.group(2)}"
+
+        print(f"\n J{nid}/26 // {item['status']} {item['time']} // DIST {item['dist']} KM")
+        print(f"\n NOTAM {fir} Q{q_code} {traf if q_match else 'IV'} {purp if q_match else 'BO'} {scop if q_match else 'AW'} {low if q_match else '000'} {upp if q_match else '004'}")
+        print(f"\n  > Q CODES : {q_desc}")
+        print(f"  > AFFECTS : {affects} ( FLIGHT RULES )")
+        print(f"  > PURPOSE : {purpose}")
+        print(f"  > SCOPE   : {scope_str}")
+        print(f"  > HIGHT   : {h_bot} ... {h_top}")
+        print(f"\n  > CENTER  : {c_disp} ( {grid} )")
+        r_match = re.search(r"(\d+\.?\d*)NM", body); rad_nm = float(r_match.group(1)) if r_match else 1.61
+        print(f"  > RADIUS  : {rad_nm}NM ( {round(rad_nm*1.85,1)}km )")
+        
+        full_url = f"https://www.google.com/maps/search/?api=1&query={lat_dec},{lon_dec}"
+        print(f"  > LINK    : \033]8;;{full_url}\033\\https://www.google.com/maps\033]8;;\033\\ ( SHORTENED )")
+        
+        choice = input("\n  > (I)NFO (M)AIN (E)XIT : ").upper().strip()
+        if choice == 'I':
+            sub = show_full_info(item, nid)
+            if sub == 'M': return 'M'
+            if sub == 'E': 
+                os.system('clear')
+                exit()
+        elif choice == 'E':
+            os.system('clear')
+            exit()
+        elif choice == 'M': return 'M'
+
+def show_full_info(item, nid):
+    while True:
+        os.system('clear')
+        print(f"\n J{nid}/26 // {item['status']} {item['time']} // DIST {item['dist']} KM\n")
+        raw = item['body']
+        head_match = re.search(r"([A-Z]{4}\s+J\s+\d+.*?)\s+E\)", raw)
+        if head_match:
+            header_str = head_match.group(1).strip()
+            print(f" {header_str}\n")
+            body_text = raw.split(" E) ")[-1].strip()
+        else:
+            body_text = raw
+        time_block = re.search(r"([A-Z]{4}\s+\d{10}\s+\d{10}\s+[\d-]+\s+)", body_text)
+        if time_block:
+            t_str = time_block.group(1).strip()
+            print(f" {t_str}\n")
+            main_content = body_text.split(t_str)[-1].strip()
+        else:
+            main_content = body_text
+        if "AR-" in main_content:
+            mission_body, footer = main_content.split("AR-", 1)
+            footer = "AR-" + footer
+        else:
+            mission_body, footer = main_content, ""
+        wrapped_body = textwrap.fill(mission_body.strip(), width=70, initial_indent=" ", subsequent_indent=" ")
+        print(f"{wrapped_body}\n")
+        if footer:
+            print(f" {footer.strip()}")
+        print("")
+        choice = input(" > (R)ETURN (M)AIN (E)XIT : ").upper().strip()
+        if choice == 'E':
+            os.system('clear')
+            exit()
+        if choice in ['R', 'M']: return choice
+             
+def run_scan(plat, plon, d_limit):
+    url = "https://pibs.nats.co.uk/operational/pibs/PIB.xml"
+    found = {}
+    try:
+        xml = re.sub(r'\sxmlns="[^"]+"', '', requests.get(url, timeout=10).text, count=1)
+        for n in ET.fromstring(xml).iter('Notam'):
+            raw_t = "".join(n.itertext())
+            c = re.search(r"(\d{4})([NS])\s*(\d{5})([EW])", raw_t)
+            if c:
+                la, lo = int(c.group(1)[:2])+(int(c.group(1)[2:])/60), (int(c.group(3)[:3])+(int(c.group(3)[3:])/60))*(-1 if c.group(4)=='W' else 1)
+                dist_val = sqrt(((la-plat)*111)**2 + ((lo-plon)*65)**2)
+                if dist_val <= d_limit:
+                    nid = n.find('Number').text
+                    raw_times = re.findall(r"\b(26\d{8})\b", raw_t)
+                    st_str = f"{raw_times[0][4:6]}{raw_times[0][2:4]} {raw_times[0][6:10]}" if raw_times else "0000"
+                    en_str = f"{raw_times[1][4:6]}{raw_times[1][2:4]} {raw_times[1][6:10]}" if len(raw_times)>1 else ""
+                    st_dt = datetime.strptime(raw_times[0], "%y%m%d%H%M") if raw_times else datetime.now()
+                    en_dt = datetime.strptime(raw_times[1], "%y%m%d%H%M") if len(raw_times)>1 else st_dt
+                    stat = "ACTIVE" if st_dt <= datetime.now() <= en_dt else "PEND"
+                    found[nid] = {'dist':round(dist_val,1), 'status':stat, 'time':f"{st_str} ... {en_str}", 'body':" ".join(raw_t.split())}
+        return found
+    except: return {}
+
+plat, plon, loc_label, dist_km = None, None, "NONE", 8.0
+while True:
+    os.system('clear')
+    if plat is None:
+        cmd = input("\n > (P)CODE (D)IST (E)XIT : ").upper().strip()
+    else:
+        now = datetime.now()
+        timestamp = now.strftime("%d%m %H%M")
+        print(f"\n NOTAM DATA RETRIEVED ASAT {timestamp} LT")
+        print(f"\n CENTERED : {loc_label} // WITHIN : {dist_km} KM")
+        print(f"\n ID   //  DIST  //  DATE TIME  //  STAT")
+        print()
+        data = run_scan(plat, plon, dist_km)
+        for nid, info in sorted(data.items(), key=lambda x: x[1]['dist']):
+            display_time = info['time'][:9]
+            display_stat = "LIVE" if info['status'] == "ACTIVE" else "PEND"
+            print(f" {nid.ljust(6)}   {str(info['dist']).ljust(4)}      {display_time.ljust(12)}   {display_stat}")
+        cmd = input("\n > (P)CODE (D)IST (E)XIT or ID : ").upper().strip()
+
+
+    if cmd == 'E': 
+        os.system('clear')
+        break
+    elif cmd == 'P':
+        pc = input("\n > PCODE : ").upper().strip()
+        r = requests.get(f"https://api.postcodes.io/postcodes/{pc.replace(' ','')}")
+        if r.status_code == 200:
+            res = r.json()['result']
+            plat, plon, loc_label = res['latitude'], res['longitude'], pc.upper()
+    elif cmd == 'D': 
+        try: dist_km = float(input("\n > DIST : ") or 8.0)
+        except: pass
+    elif plat is not None:
+        target = cmd.strip()
+        found_id = None
+        for nid in data.keys():
+            if target in nid:
+                found_id = nid
+                break
+        if found_id:
+            res = show_summary_view(data[found_id], found_id)
+            if res == 'E':
+                os.system('clear')
+                break
+        elif target:
+            input(f"\n > [!] {target} NOT FOUND ... PRESS [ ENTER ] ")
