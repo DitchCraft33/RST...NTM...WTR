@@ -1,0 +1,185 @@
+import requests, os, math
+from datetime import datetime
+
+def get_weather(lat, lon):
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,cloud_cover,wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,dew_point_2m,surface_pressure&hourly=precipitation_probability,wind_speed_10m,wind_gusts_10m,temperature_2m,dew_point_2m&daily=sunrise,sunset&wind_speed_unit=kn&timezone=auto&forecast_days=4"
+    try:
+        r = requests.get(url, timeout=5).json()
+        return r
+    except: return None
+
+def get_moon_phase():
+    diff = datetime.now() - datetime(2000, 1, 6)
+    days = diff.days + diff.seconds / 86400
+    lunation = (days % 29.530588853) / 29.530588853
+    phases = [
+        (0.06, "NEW MOON"), (0.19, "WAXING CRESCENT"), (0.31, "FIRST QUARTER"),
+        (0.44, "WAXING GIBBOUS"), (0.56, "FULL MOON"), (0.69, "WANING GIBBOUS"),
+        (0.81, "LAST QUARTER"), (0.94, "WANING CRESCENT")
+    ]
+    for limit, name in phases:
+        if lunation < limit: return name
+    return "NEW MOON"
+
+def decode_wmo(code):
+    mapping = {0: "CLEAR SKIES", 1: "MAINLY CLEAR", 2: "PARTLY CLOUDY", 3: "OVERCAST",
+               45: "FOGGY", 51: "LIGHT DRIZZLE", 61: "LIGHT RAIN", 80: "LIGHT SHOWERS", 95: "THUNDER"}
+    return mapping.get(code, "STABLE")
+
+def get_cardinal(deg):
+    dirs = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
+    return dirs[int((deg + 11.25) / 22.5) % 16]
+
+def show_forecast(raw_data, label, hours):
+    os.system('clear')
+    h = raw_data['hourly']
+    curr_idx = datetime.now().hour
+    end_idx = curr_idx + hours
+    step = max(1, hours // 10) 
+    indices = [curr_idx + (i * step) for i in range(10)]
+    print(f"\n OM-FORECAST // {hours} H TREND // {label}\n")
+    head_fmt = "{:<8}"
+    col_fmt = "{:<7}"
+    row_time = head_fmt.format(" TIME    : ")
+    row_temp = head_fmt.format(" > TEMP : ")
+    row_wind = head_fmt.format(" > WIND : ")
+    row_gust = head_fmt.format(" > GUST : ")
+    row_rain = head_fmt.format(" > RAIN : ")
+    for i in indices:
+        dt = datetime.fromisoformat(h['time'][i])
+        mph = round(h['wind_speed_10m'][i] * 1.15078)
+        gmph = round(h['wind_gusts_10m'][i] * 1.15078)
+        row_time += col_fmt.format(dt.strftime('%d/%H'))
+        row_temp += col_fmt.format(f"{round(h['temperature_2m'][i])}°C")
+        row_wind += col_fmt.format(f"{mph}M")
+        row_gust += col_fmt.format(f"{gmph}M")
+        row_rain += col_fmt.format(f"{h['precipitation_probability'][i]}%")
+
+    print(f"{row_time}\n")
+    print(f"{row_temp}\n\n{row_wind}\n\n{row_gust}\n\n{row_rain}")
+    print(f"\n")
+    rain_windows = []
+    in_rain, start_t, max_prob = False, "", 0
+    max_w, max_w_t = 0, ""
+    max_g, max_g_t = 0, ""
+    for i in range(curr_idx, end_idx):
+        t_str = datetime.fromisoformat(h['time'][i]).strftime("%d/%H%M")
+        prob = h['precipitation_probability'][i]
+        if prob > 30:
+            if not in_rain:
+                start_t, in_rain, max_prob = t_str, True, prob
+            max_prob = max(max_prob, prob)
+        elif in_rain:
+            intensity = "LIGHT" if max_prob < 50 else "MOD" if max_prob < 80 else "HEAVY"
+            rain_windows.append(f"{start_t}...{t_str}({intensity})")
+            in_rain = False
+        w_mph = round(h['wind_speed_10m'][i] * 1.15078)
+        g_mph = round(h['wind_gusts_10m'][i] * 1.15078)
+        if w_mph > max_w:
+            max_w, max_w_t = w_mph, t_str
+        if g_mph > max_g:
+            max_g, max_g_t = g_mph, t_str
+    fog_info = "NIL PREDICTED"
+    if 'dew_point_2m' in h:
+        for i in range(curr_idx, end_idx):
+            if abs(h['temperature_2m'][i] - h['dew_point_2m'][i]) < 1.5:
+                fog_info = f"{datetime.fromisoformat(h['time'][i]).strftime('%d/%H%M')} (VIS RISK)"
+                break
+                
+    rain_str = " // ".join(rain_windows) if rain_windows else "NIL EXPECTED"
+    print(f" RAIN WINDOWS  : {rain_str}")
+    print(f"\n FOG PREDICTED : {fog_info}")
+    print(f"\n WIND HIGHEST  : {max_w} MPH @ {max_w_t}")
+    print(f"\n GUST HIGHEST  : {max_g} MPH @ {max_g_t}")
+    get_input("\n [ ENTER ] TO RETURN ... (E)XIT : ")
+    os.system('clear')
+    
+def get_input(prompt):
+    val = input(prompt).strip().upper()
+    if val == 'E':
+        os.system('clear')
+        exit()
+    return val
+
+os.system('clear')
+
+plat, plon, loc_label = None, None, "NONE"
+fail_count = 0  
+
+while True:
+    if plat is None:
+        os.system('clear')
+        cmd = get_input("\n > (P)CODE (E)XIT : ")
+        
+        if cmd == 'P':
+            pc = get_input("\n > PCODE : ")
+            r = requests.get(f"https://api.postcodes.io/postcodes/{pc.replace(' ','')}")
+            
+            if r.status_code == 200:
+                res = r.json()['result']
+                plat, plon, loc_label = res['latitude'], res['longitude'], pc.upper()
+                fail_count = 0 
+                os.system('clear')
+            else:
+                print("\n PCODE ILLEGIT ...")
+                time.sleep(1)
+                continue 
+        else:
+            continue
+
+    full_data = get_weather(plat, plon)
+    if full_data:
+        os.system('clear')
+        wx = full_data['current']
+        now_ts = datetime.now().strftime("%d%m %H%M")
+        hour_idx = datetime.now().hour
+        prob_now = full_data['hourly']['precipitation_probability'][hour_idx]
+        print(f"\n  OM DATA {loc_label} ASAT {now_ts} LOCAL")
+        status = f"LIVE RAIN ({wx['precipitation']} MM)" if wx['precipitation'] > 0 else "DRY / CLEAR"
+        predict = f"{prob_now}% CHANCE OF PRECIP" if prob_now > 0 else "NIL PRECIP EXPECTED"
+        
+        print(f"\n  > STATUS    : {status}")
+        print(f"  > SKY       : {decode_wmo(wx['weather_code'])} ( {wx['cloud_cover']}% COVER )")
+        print(f"  > PREDICTED : {predict}")
+        
+        print(f"\n  > TEMP      : {wx['temperature_2m']}°C ( DEW : {wx['dew_point_2m']}°C )")
+        print(f"  > HUMIDITY  : {wx['relative_humidity_2m']}%")
+        print(f"  > PRESSURE  : {wx['surface_pressure']} HPA")
+        
+        card = get_cardinal(wx['wind_direction_10m'])
+        mils = round(wx['wind_direction_10m'] * 17.7778)
+        mph = round(wx['wind_speed_10m'] * 1.15078, 1)
+        g_mph = round(wx['wind_gusts_10m'] * 1.15078, 1)
+        print(f"\n  > WIND      : {mils} MILS ( {card} ) AT {wx['wind_speed_10m']} KT ( {mph} MPH )")
+        print(f"  > GUSTS     : {mils} MILS ( {card} ) AT {wx['wind_gusts_10m']} KT ( {g_mph} MPH )")
+        
+        vis_km = round(wx['visibility'] / 1000, 1)
+        print(f"\n  > VISIBTY   : {vis_km} KM")
+        
+        spread = wx['temperature_2m'] - wx['dew_point_2m']
+        ceiling_ft = int((spread / 2.5) * 1000)
+        ceiling_m = int(ceiling_ft * 0.3048)
+        if spread <= 1.0:
+            c_msg = f"{ceiling_ft} FT ( {ceiling_m} M ) AGL // FOG LOW VIS "
+        else:
+            c_msg = f"{ceiling_ft} FT ( {ceiling_m} M ) AGL "
+        print(f"  > CEILING   : {c_msg}")
+        
+        sunrise = full_data['daily']['sunrise'][0].split('T')[-1].replace(':', '')
+        sunset = full_data['daily']['sunset'][0].split('T')[-1].replace(':', '')
+        print(f"\n  > MOON STAT : {get_moon_phase()}")
+        print(f"  > FL ... LL : {sunrise} ... {sunset}")
+    else:
+        print("\n [!] ERROR RETRIEVING DATA")
+        
+    cmd = get_input("\n  > (R)EFRESH (P)CODE (F)ORECAST (E)XIT : ")
+    
+    if cmd == 'P': 
+        plat = None
+       
+    if cmd == 'F' and full_data:
+        f_range = get_input("\n  HOURS (1)2 (2)4 (7)2 (E)XIT : ")
+        if f_range in ['1', '2', '7']:
+            if f_range == '1': show_forecast(full_data, loc_label, 12)
+            if f_range == '2': show_forecast(full_data, loc_label, 24)
+            if f_range == '7': show_forecast(full_data, loc_label, 72)
